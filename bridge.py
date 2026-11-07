@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -145,13 +146,22 @@ def upload(path: Path, contacts: dict) -> int:
     pace_write()
     meta = describe(path, contacts)
     key = hashlib.sha256(str(path.relative_to(RECORDINGS_DIR)).encode()).hexdigest()[:64]
-    cmd = ["curl", "-sS", "--fail-with-body", "-H", f"Authorization: Bearer {CFG['SPEAKR_TOKEN']}",
-           "-F", f"file=@{path}", "-F", f"language={LANGUAGE}", "-F", f"idempotency_key={key}",
-           "-F", f"file_last_modified={int(path.stat().st_mtime * 1000)}"]
-    for field, value in meta.items():
-        cmd += ["--form-string", f"{field}={value}"]
-    proc = subprocess.run(cmd + [f"{SPEAKR}/api/v1/recordings/upload", "-w", "\n%{http_code}"],
-                          capture_output=True, text=True)
+    with tempfile.TemporaryDirectory(prefix="call-transcriber-") as tmp:
+        # Copy first: an online-only Google Drive / iCloud file is materialized
+        # lazily, and curl streaming it directly gets cut off after ~1 KB.
+        # The copy blocks until the whole file is downloaded.
+        local = Path(tmp) / ("recording" + path.suffix.lower())
+        shutil.copyfile(path, local)
+        if local.stat().st_size != path.stat().st_size:
+            raise RuntimeError(f"incomplete copy ({local.stat().st_size}/{path.stat().st_size} bytes)")
+        filename = re.sub(r'[;,"\\]', " ", path.name)  # characters curl's -F syntax would misread
+        cmd = ["curl", "-sS", "--fail-with-body", "-H", f"Authorization: Bearer {CFG['SPEAKR_TOKEN']}",
+               "-F", f'file=@{local};filename="{filename}"', "-F", f"language={LANGUAGE}",
+               "-F", f"idempotency_key={key}", "-F", f"file_last_modified={int(path.stat().st_mtime * 1000)}"]
+        for field, value in meta.items():
+            cmd += ["--form-string", f"{field}={value}"]
+        proc = subprocess.run(cmd + [f"{SPEAKR}/api/v1/recordings/upload", "-w", "\n%{http_code}"],
+                              capture_output=True, text=True)
     body, _, code = proc.stdout.rpartition("\n")
     if code == "429":
         raise RateLimited()
@@ -300,7 +310,24 @@ def single_instance() -> None:
     globals()["_lock"] = lock  # keep the descriptor (and the lock) alive
 
 
+def allow_cloud_downloads() -> None:
+    """Let this process materialize online-only (dataless) files.
+
+    Processes started by launchd may have materialization turned off, and then
+    reading a not-yet-downloaded Google Drive / iCloud file fails with
+    EDEADLK ("Resource deadlock avoided"). setiopolicy_np turns it back on.
+    """
+    import ctypes
+
+    IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_ON = 3, 0, 2
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+                           IOPOL_MATERIALIZE_DATALESS_FILES_ON) != 0:
+        log(f"could not enable cloud file downloads (errno {ctypes.get_errno()})")
+
+
 def main() -> None:
+    allow_cloud_downloads()
     single_instance()
     log(f"watching {RECORDINGS_DIR} -> {SPEAKR}")
     state = load_state()
