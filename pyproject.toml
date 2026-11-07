@@ -1,0 +1,14 @@
+[project]
+name = "call-transcriber-asr"
+version = "0.1.0"
+description = "Speakr-compatible /asr service: whisper.cpp (Metal, ivrit.ai) + pyannote diarization (MPS)"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "python-multipart>=0.0.9",
+  "pyannote.audio>=4.0",
+  "torch>=2.5",
+  "torchaudio>=2.5",
+  "numpy",
+]
