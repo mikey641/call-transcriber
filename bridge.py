@@ -62,6 +62,7 @@ NO_SPEECH = CFG.get("NO_SPEECH_TEXT", "[אין דיבור]")
 SETTLE_SECONDS = 20
 MAX_RETRIES = 2
 MAX_UPLOAD_ATTEMPTS = 5
+COPY_TIMEOUT = 300  # seconds to wait for a cloud file to download
 WRITE_INTERVAL = 2.5  # seconds between API writes (Speakr: 30 per minute per token)
 NAMING_VERSION = 2  # bump when describe() changes to retitle existing uploads  # Speakr reprocess attempts for a failed recording
 # launchd and app wrappers start with a minimal PATH
@@ -142,6 +143,25 @@ def describe(path: Path, contacts: dict) -> dict:
     return info
 
 
+COPY_SCRIPT = """
+import ctypes, shutil, sys
+ctypes.CDLL(None).setiopolicy_np(3, 0, 2)  # allow downloading online-only files
+shutil.copyfile(sys.argv[1], sys.argv[2])
+"""
+
+
+def copy_with_timeout(src: Path, dst: Path) -> None:
+    """Copy in a child process: a Drive download that never completes blocks
+    read() uninterruptibly, so a timeout has to kill the reader."""
+    try:
+        subprocess.run([sys.executable, "-c", COPY_SCRIPT, str(src), str(dst)],
+                       check=True, capture_output=True, timeout=COPY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"download from the cloud took over {COPY_TIMEOUT}s") from None
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(e.stderr.decode(errors="replace").strip().splitlines()[-1]) from None
+
+
 def upload(path: Path, contacts: dict) -> int:
     pace_write()
     meta = describe(path, contacts)
@@ -151,7 +171,7 @@ def upload(path: Path, contacts: dict) -> int:
         # lazily, and curl streaming it directly gets cut off after ~1 KB.
         # The copy blocks until the whole file is downloaded.
         local = Path(tmp) / ("recording" + path.suffix.lower())
-        shutil.copyfile(path, local)
+        copy_with_timeout(path, local)
         if local.stat().st_size != path.stat().st_size:
             raise RuntimeError(f"incomplete copy ({local.stat().st_size}/{path.stat().st_size} bytes)")
         filename = re.sub(r'[;,"\\]', " ", path.name)  # characters curl's -F syntax would misread
